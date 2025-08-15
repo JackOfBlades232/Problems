@@ -3,6 +3,12 @@
 !*.*
 
 *.o
+*.obj
+*.exe
+*.ilk
+*.pdb
+
+.vs/
 
 __pycache__
 
