@@ -20,8 +20,6 @@
 #include <set>
 #endif
 
-#define ARRCNT(a_) (sizeof(a_) / sizeof((a_)[0]))
-
 #ifdef LOGGING
 #define LOG(fmt_, ...) \
     (fprintf(stderr, "[L] " fmt_ "\n" __VA_OPT__(,) __VA_ARGS__))
@@ -85,6 +83,29 @@ class BTree {
     size_t m_size = 0;
     typename TPage::lctx_t m_lctx;
 
+#ifndef NDEBUG
+    struct {
+        size_t ops = 0;
+        size_t size = 0;
+        size_t height = 0;
+        size_t max_size = 0;
+        size_t max_height = 0;
+        size_t inserts = 0;
+        size_t deletes = 0;
+        size_t searches = 0;
+        size_t splits = 0;
+        size_t merges = 0;
+        size_t root_pushes = 0;
+        size_t root_pops = 0;
+        size_t rotations = 0;
+        size_t page_allocations = 0;
+        size_t page_frees = 0;
+        size_t page_reads = 0;
+        size_t page_writes = 0;
+    } mutable m_stats{};
+    char const *m_tag = "";
+#endif
+
     using lctx_t = typename TPage::lctx_t;
     using elem_t = BTreePageTraits<TPage>::elem_t;
     using ref_t = BTreePageTraits<TPage>::ref_t;
@@ -98,12 +119,12 @@ public:
     using page_t = TPage;
 #endif
 
-    explicit BTree(lctx_t &&lctx) : m_lctx{std::move(lctx)} {
-        m_root = TPage::Allocate(m_lctx);
-        m_root.Data().size = 0;
-        m_root.Data().is_leaf = true;
-        WritePageBack(m_root);
-    }
+    explicit BTree(lctx_t &&lctx) : m_lctx{std::move(lctx)} { Init(); }
+#ifndef NDEBUG
+    BTree(lctx_t &&lctx, char const *tag) : m_lctx{std::move(lctx)}, m_tag{tag}
+        { Init(); }
+#endif
+
     BTree(BTree &&) = default;
     BTree &operator=(BTree &&) = default;
     BTree(BTree const &) = delete;
@@ -120,7 +141,6 @@ public:
         for (;;) {
             auto &node = *data;
             size_t chid = 0;
-            // @TODO: configurable search function
             while (chid < node.size && k > node.keys[chid]) {
                 ++chid;
             }
@@ -137,12 +157,13 @@ public:
 
     void Insert(elem_t const &k) {
         if (m_root.Data().size == c_max_sz) {
-            TPage new_root = TPage::Allocate(m_lctx);
+            TPage new_root = AllocatePage();
             new_root.Data().size = 0;
             new_root.Data().is_leaf = false;
             new_root.Data().children[0] = m_root.Data().self_ref;
             SplitChild(new_root, m_root, 0);
             m_root = std::move(new_root);
+            ReportRootPush();
         }
         auto *cur_page = &m_root;
         auto *data = &cur_page->Data();
@@ -152,7 +173,6 @@ public:
             auto &node = *data;
             ssize_t chid = node.size - 1;
             if (node.is_leaf) {
-                // @TODO: configurable search function
                 while (chid >= 0 && k < node.keys[chid]) {
                     node.keys[chid + 1] = node.keys[chid];
                     --chid;
@@ -160,9 +180,9 @@ public:
                 node.keys[chid + 1] = k;
                 ++node.size;
                 WritePageBack(page);
+                ReportInsert();
                 break;
             } else {
-                // @TODO: configurable search function
                 while (chid >= 0 && k < node.keys[chid]) {
                     --chid;
                 }
@@ -183,12 +203,250 @@ public:
         ++m_size;
     }
 
+    bool Delete(elem_t const &k) {
+        if (m_size == 0) {
+            return false;
+        } else if (m_root.Data().size == 0) {
+            TPage new_root = ReadPageIn(m_root.Data().children[0]);
+            FreePage(std::move(m_root));
+            m_root = std::move(new_root);
+            ReportRootPop();
+        }
+        enum search_method_t {
+            e_sm_search,
+            e_sm_bottommost,
+            e_sm_topmost,
+            e_sm_middle
+        } sm = e_sm_search;
+        struct search_res_t {
+            uint32_t index : 31;
+            uint32_t found : 1;
+        };
+        auto search = [&k](auto const &node, search_method_t cur_sm) {
+            switch (cur_sm) {
+            case e_sm_search: {
+                uint32_t chid = 0;
+                while (chid < node.size && k > node.keys[chid]) {
+                    ++chid;
+                }
+                return search_res_t{
+                    .index = chid,
+                    .found = chid < node.size && k == node.keys[chid]
+                };
+            }
+            case e_sm_bottommost: {
+                return search_res_t{.index = 0, .found = node.is_leaf};
+            }
+            case e_sm_topmost: {
+                return node.is_leaf
+                    ? search_res_t{.index = node.size - 1u, .found = true }
+                    : search_res_t{.index = node.size,      .found = false};
+            }
+            case e_sm_middle: {
+                return search_res_t{.index = c_min_sz, .found = true};
+            }
+            default: {
+                assert(0);
+                return search_res_t{};
+            }
+            }
+        };
+        auto *cur_page = &m_root;
+        decltype(cur_page) found_page = nullptr;
+        auto *data = &cur_page->Data();
+        TPage loaded_page{};
+        TPage loaded_found_page{};
+        elem_t *replacement_slot = nullptr;
+        for (;;) {
+            auto &page = *cur_page;
+            auto &node = *data;
+            search_res_t sr = search(node, sm);
+            if (node.is_leaf) {
+                if (!sr.found && !replacement_slot) {
+                    return false;
+                }
+                if (replacement_slot) {
+                    *replacement_slot = node.keys[sr.index];
+                    assert(found_page);
+                    WritePageBack(*found_page);
+                }
+                for (size_t i = sr.index + 1; i < node.size; ++i) {
+                    node.keys[i - 1] = node.keys[i];
+                }
+                --node.size;
+                --m_size;
+                WritePageBack(page);
+                ReportDelete();
+                return true;
+            } else {
+                if (sr.found) {
+                    TPage lpage = ReadPageIn(node.children[sr.index]);
+                    if (lpage.Data().size > c_min_sz) {
+                        replacement_slot = &node.keys[sr.index];
+                        if (cur_page == &loaded_page) {
+                            loaded_found_page = std::move(loaded_page);
+                            found_page = &loaded_found_page;
+                        } else {
+                            found_page = cur_page;
+                        }
+                        loaded_page = std::move(lpage);
+                        sm = e_sm_topmost;
+                    } else {
+                        TPage rpage = ReadPageIn(node.children[sr.index + 1]);
+                        if (rpage.Data().size > c_min_sz) {
+                            replacement_slot = &node.keys[sr.index];
+                            if (cur_page == &loaded_page) {
+                                loaded_found_page = std::move(loaded_page);
+                                found_page = &loaded_found_page;
+                            } else {
+                                found_page = cur_page;
+                            }
+                            loaded_page = std::move(rpage);
+                            sm = e_sm_bottommost;
+                        } else {
+                            loaded_page = MergeChildren(
+                                page, lpage, rpage, sr.index);
+                            sm = e_sm_middle;
+                        }
+                    }
+                } else {
+                    TPage cpage = ReadPageIn(node.children[sr.index]);
+                    if (cpage.Data().size > c_min_sz) {
+                        loaded_page = std::move(cpage);
+                    } else {
+                        TPage lpage{};
+                        TPage rpage{};
+                        if (sr.index > 0) {
+                            lpage = ReadPageIn(node.children[sr.index - 1]);
+                            if (lpage.Data().size > c_min_sz) {
+                                for (
+                                    size_t i = cpage.Data().size;
+                                    i > 0; --i)
+                                {
+                                    cpage.Data().keys[i] =
+                                        cpage.Data().keys[i - 1];
+                                }
+                                for (
+                                    size_t i = cpage.Data().size + 1;
+                                    i > 0; --i)
+                                {
+                                    cpage.Data().children[i] =
+                                        cpage.Data().children[i - 1];
+                                }
+                                cpage.Data().keys[0] =
+                                    node.keys[sr.index - 1];
+                                cpage.Data().children[0] =
+                                    lpage.Data().children[lpage.Data().size];
+                                node.keys[sr.index - 1] =
+                                    lpage.Data().keys[lpage.Data().size - 1];
+                                --lpage.Data().size;
+                                ++cpage.Data().size;
+                                WritePageBack(page);
+                                WritePageBack(cpage);
+                                WritePageBack(lpage);
+                                loaded_page = std::move(cpage);
+                                ReportRotation();
+                                goto descend;
+                            }
+                        }
+                        if (sr.index < node.size) {
+                            lpage = {};
+                            rpage = ReadPageIn(node.children[sr.index + 1]);
+                            if (rpage.Data().size > c_min_sz) {
+                                cpage.Data().keys[cpage.Data().size] =
+                                    node.keys[sr.index];
+                                cpage.Data().children[cpage.Data().size + 1] =
+                                    rpage.Data().children[0];
+                                node.keys[sr.index] =
+                                    rpage.Data().keys[0];
+                                for (
+                                    size_t i = 0;
+                                    i < rpage.Data().size; ++i)
+                                {
+                                    rpage.Data().keys[i] =
+                                        rpage.Data().keys[i + 1];
+                                }
+                                for (
+                                    size_t i = 0;
+                                    i < rpage.Data().size + 1; ++i)
+                                {
+                                    rpage.Data().children[i] =
+                                        rpage.Data().children[i + 1];
+                                }
+                                --rpage.Data().size;
+                                ++cpage.Data().size;
+                                WritePageBack(page);
+                                WritePageBack(cpage);
+                                WritePageBack(rpage);
+                                loaded_page = std::move(cpage);
+                                ReportRotation();
+                                goto descend;
+                            }
+                        }
+                        if (lpage) {
+                            loaded_page = MergeChildren(
+                                page, lpage, cpage, sr.index - 1);
+                        } else if (rpage) {
+                            loaded_page = MergeChildren(
+                                page, cpage, rpage, sr.index);
+                        }
+                    }
+                }
+            descend:
+                cur_page = &loaded_page;
+                data = &loaded_page.Data();
+            }
+        }
+    }
+
     size_t Size() const { return m_size; }
     size_t Empty() const { return m_size == 0; }
 
+#ifndef NDEBUG
+    void DumpStats() const {
+        fprintf(stderr, "=== BTree \"%s\" perf dump ===\n", m_tag);
+        fprintf(stderr, "  Total:       %-7lu\n", m_stats.ops);
+        fprintf(stderr, "  Inserts:     %-7lu (%-5.2f%% of ops)\n",
+            m_stats.inserts,
+            (float(m_stats.inserts) / m_stats.ops) * 100.f);
+        fprintf(stderr, "  Deletes:     %-7lu (%-5.2f%% of ops)\n",
+            m_stats.deletes,
+            (float(m_stats.deletes) / m_stats.ops) * 100.f);
+        fprintf(stderr, "  Max size:    %-7lu (%-5.2f%% of ops)\n",
+            m_stats.max_size,
+            (float(m_stats.max_size) / m_stats.ops) * 100.f);
+        fprintf(stderr, "  Max height:  %-7lu (%-5.2f%% of ops)\n",
+            m_stats.max_height,
+            (float(m_stats.max_height) / m_stats.ops) * 100.f);
+        fprintf(stderr, "  Root pushes: %-7lu (%-5.2f%% of inserts)\n",
+            m_stats.root_pushes,
+            (float(m_stats.root_pushes) / m_stats.inserts) * 100.f);
+        fprintf(stderr, "  Root pops:   %-7lu (%-5.2f%% of deletes)\n",
+            m_stats.root_pops,
+            (float(m_stats.root_pops) / m_stats.deletes) * 100.f);
+        fprintf(stderr, "  Splits:      %-7lu\n", m_stats.splits);
+        fprintf(stderr, "  Merges:      %-7lu\n", m_stats.merges);
+        fprintf(stderr, "  Rotations:   %-7lu\n", m_stats.rotations);
+        fprintf(stderr, "  Page allocs: %-7lu\n", m_stats.page_allocations);
+        fprintf(stderr, "  Page frees:  %-7lu\n", m_stats.page_frees);
+        fprintf(stderr, "  Page reads:  %-7lu\n", m_stats.page_reads);
+        fprintf(stderr, "  Page writes: %-7lu\n", m_stats.page_writes);
+        fprintf(stderr, "=== end dump ===\n");
+    }
+#else
+    void DumpStats() const {}
+#endif
+
 private:
+    void Init() {
+        m_root = AllocatePage();
+        m_root.Data().size = 0;
+        m_root.Data().is_leaf = true;
+        WritePageBack(m_root);
+    }
+
     TPage SplitChild(TPage &parent, TPage &child, size_t chid) {
-        TPage r = TPage::Allocate(m_lctx);
+        TPage r = AllocatePage();
         auto &rnode = r.Data();
         auto &cnode = child.Data();
         auto &pnode = parent.Data();
@@ -215,13 +473,102 @@ private:
         WritePageBack(r);
         WritePageBack(child);
         WritePageBack(parent);
+        ReportSplit();
         return r;
     }
 
-    void WritePageBack(TPage const &page)
-        { TPage::Write(m_lctx, page, page.Data().self_ref); }
-    TPage ReadPageIn(ref_t const &ref) const
-        { return TPage::Read(m_lctx, ref); }
+    TPage MergeChildren(TPage &parent, TPage &l, TPage &r, size_t chid) {
+        auto &pnode = parent.Data();
+        auto &lnode = l.Data();
+        auto &rnode = r.Data();
+        for (size_t i = 0; i < rnode.size; ++i) {
+            lnode.keys[i + c_t] = rnode.keys[i];
+        }
+        lnode.keys[c_t - 1] = pnode.keys[chid];
+        if (!rnode.is_leaf) {
+            for (size_t i = 0; i <= rnode.size; ++i) {
+                lnode.children[i + c_t] = rnode.children[i];
+            }
+        }
+        for (size_t i = chid + 1; i < pnode.size; ++i) {
+            pnode.children[i] = pnode.children[i + 1];
+        }
+        for (size_t i = chid; i < pnode.size; ++i) {
+            pnode.keys[i] = pnode.keys[i + 1];
+        }
+        --pnode.size;
+        lnode.size = 2 * c_t - 1;
+        FreePage(std::move(r));
+        WritePageBack(l);
+        WritePageBack(parent);
+        ReportMerge();
+        return std::move(l);
+    }
+
+    void WritePageBack(TPage const &page) {
+        TPage::Write(m_lctx, page, page.Data().self_ref);
+        ReportPageWrite();
+    }
+    TPage ReadPageIn(ref_t const &ref) const {
+        ReportPageRead();
+        return TPage::Read(m_lctx, ref);
+    }
+    TPage AllocatePage() {
+        ReportPageAlloc();
+        return TPage::Allocate(m_lctx);
+    }
+    void FreePage(TPage &&page) {
+        ReportPageFree();
+        TPage pg{std::move(page)};
+        return TPage::Free(m_lctx, pg.Data().self_ref);
+    }
+
+#ifndef NDEBUG
+    void ReportInsert() const {
+        ++m_stats.ops;
+        ++m_stats.inserts;
+        ++m_stats.size;
+        m_stats.max_size = std::max(m_stats.max_size, m_stats.size);
+    }
+    void ReportDelete() const {
+        ++m_stats.ops;
+        ++m_stats.deletes;
+        --m_stats.size;
+    }
+    void ReportSearch() const {
+        ++m_stats.ops;
+        ++m_stats.searches;
+    }
+    void ReportRootPush() const {
+        ++m_stats.root_pushes;
+        ++m_stats.height;
+        m_stats.max_height = std::max(m_stats.max_height, m_stats.height);
+    }
+    void ReportRootPop() const {
+        ++m_stats.root_pops;
+        --m_stats.height;
+    }
+    void ReportSplit()     const { ++m_stats.splits; }
+    void ReportMerge()     const { ++m_stats.merges; }
+    void ReportRotation()  const { ++m_stats.rotations; }
+    void ReportPageAlloc() const { ++m_stats.page_allocations; }
+    void ReportPageFree()  const { ++m_stats.page_frees; }
+    void ReportPageRead()  const { ++m_stats.page_reads; }
+    void ReportPageWrite() const { ++m_stats.page_writes; }
+#else
+    void ReportInsert()    const {}
+    void ReportDelete()    const {}
+    void ReportSearch()    const {}
+    void ReportRootPush()  const {}
+    void ReportRootPop()   const {}
+    void ReportSplit()     const {}
+    void ReportMerge()     const {}
+    void ReportRotation()  const {}
+    void ReportPageAlloc() const {}
+    void ReportPageFree()  const {}
+    void ReportPageRead()  const {}
+    void ReportPageWrite() const {}
+#endif
 };
 
 #ifdef VALIDATE
@@ -274,6 +621,13 @@ public:
         { m_mirror.insert(e); }
     void CheckSearch(elem_t const &e, bool res) const
         { VASSERT(m_mirror.contains(e) == res); }
+
+    void CheckDelete(elem_t const &e, bool res) {
+        auto it = m_mirror.find(e);
+        VASSERT((it != m_mirror.end()) == res);
+        if (it != m_mirror.end())
+            m_mirror.erase(it);
+    }
 
 private:
     void ValidateNode(
@@ -419,7 +773,9 @@ public:
         static constexpr size_t c_page_size_bytes =
             sizeof(BTreeNodeData<T, size_t, t_t>);
 
-        auto &Data() { return *data; }
+        explicit operator bool() const { return data != nullptr; }
+
+        auto &Data()             { return *data; }
         auto const &Data() const { return *data; }
 
         static void Write(lctx_t &lctx, Page const &pg, size_t pid)
@@ -494,7 +850,11 @@ static auto create_file_pod_btree(char const *path)
     if (!lf) {
         return std::optional<tree_t>{std::nullopt};
     }
+#ifdef NDEBUG
     return std::optional<tree_t>{tree_t{std::move(lf)}};
+#else
+    return std::optional<tree_t>{tree_t{std::move(lf), path}};
+#endif
 }
 
 int main(int argc, char **argv)
@@ -520,18 +880,29 @@ int main(int argc, char **argv)
 #define VASSERT(cond_) validator.Assert((cond_), #cond_)
 #endif
 
-    size_t cmd_id = 0;
+    [[maybe_unused]] size_t cmd_id = 0;
     while (std::cin.good()) {
         char cmd;
         std::cin >> cmd;
         switch (cmd) {
-        case '<': {
+        case '+': {
             test_type_t item;
             std::cin >> item;
             LOG("%lu: inserting %d", cmd_id, item);
             bt.Insert(item);
 #ifdef VALIDATE
             validator.CheckInsert(item);
+#endif
+            break;
+        }
+        case '-': {
+            test_type_t item;
+            std::cin >> item;
+            LOG("%lu: deleting %d", cmd_id, item);
+            bool removed = bt.Delete(item);
+            printf("%s %d\n", removed ? "Removed" : "Not present", item);
+#ifdef VALIDATE
+            validator.CheckDelete(item, removed);
 #endif
             break;
         }
@@ -555,6 +926,8 @@ int main(int argc, char **argv)
 #endif
         ++cmd_id;
     }
+
+    bt.DumpStats();
 }
 
 #else
@@ -569,7 +942,8 @@ int main(int argc, char **argv)
     size_t const cmd_count = atol(argv[1]);
 
     constexpr double c_insert_probability = 0.4f;
-    constexpr double c_lookup_existing_probability = 0.7f;
+    constexpr double c_delete_probability = 0.4f;
+    constexpr double c_choose_existing_probability = 0.7f;
 
     srand(time(nullptr));
 
@@ -581,29 +955,31 @@ int main(int argc, char **argv)
         double type_cast = cast();
         if (type_cast <= c_insert_probability) {
             int elem = rand();
-            printf("< %d\n", elem);
+            printf("+ %d\n", elem);
             tracker.insert(elem);
         } else {
-            if (tracker.size() && cast() < c_lookup_existing_probability) {
+            type_cast -= c_insert_probability;
+            bool is_delete = type_cast <= c_delete_probability;
+            char glyph = is_delete ? '-' : '?';
+            if (tracker.size() && cast() < c_choose_existing_probability) {
                 int id = rand() % tracker.size();
                 auto it = tracker.begin();
                 while (id--) {
                     ++it;
                 }
-                printf("? %d\n", *it);
+                printf("%c %d\n", glyph, *it);
+                if (is_delete) {
+                    tracker.erase(it);
+                }
             } else {
                 int elem;
                 do {
                     elem = rand();
                 } while (tracker.contains(elem));
-                printf("? %d\n", elem);
+                printf("%c %d\n", glyph, elem);
             }
         }
     }
 }
 
 #endif
-
-// @TODO: BTree: delete
-// @TODO: test/validation
-// @TODO: stats
